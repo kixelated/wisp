@@ -18,6 +18,8 @@ fn main() -> anyhow::Result<()> {
         match task {
             Task::Accept{..} => {
                 let fd = ret?;
+
+                let accept_task = Task::Accept{fd: listener.as_raw_fd()};
                 let _accept_id = runtime.push(accept_task)?;
 
                 let buffer = vec![0u8; 2048].into_boxed_slice();
@@ -35,7 +37,7 @@ fn main() -> anyhow::Result<()> {
             },
             */
             Task::Read{ fd, buffer, .. } => {
-                let size = ret?;
+                let size = ret? as usize;
 
                 if size == 0 {
                     println!("EOF");
@@ -45,20 +47,20 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                let buffer = buffer[..size];
+                let buffer = &buffer[..size];
 
                 println!("read {}", String::from_utf8_lossy(buffer));
 
                 let write_task = Task::Write{
                     fd: fd,
-                    buffer: buffer,
+                    buffer: Box::from(buffer),
                 };
 
                 let _write_id = runtime.push(write_task)?;
             },
             Task::Write{ buffer, .. } => {
-                let size = ret?;
-                let buffer = buffer[..size];
+                let size = ret? as usize;
+                let buffer = &buffer[..size];
 
                 println!("wrote {}", String::from_utf8_lossy(buffer));
             },
