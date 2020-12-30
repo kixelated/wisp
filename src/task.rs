@@ -8,6 +8,11 @@ pub enum Task {
         fd: RawFd,
     },
 
+    // Close a socket.
+    Close {
+        fd: RawFd,
+    },
+
     // Dial a TCP connection to the given address.
     /*
     Connect {
