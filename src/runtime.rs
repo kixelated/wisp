@@ -1,10 +1,11 @@
 use super::Task;
 
 use std::{io, ptr};
+use std::collections::LinkedList;
 
 use io_uring::IoUring;
 use io_uring::opcode::{self, types};
-use io_uring::squeue::Flags;
+use io_uring::squeue::{Entry,Flags};
 
 use anyhow::{anyhow, Result};
 use slab::Slab;
@@ -12,6 +13,7 @@ use slab::Slab;
 pub struct Runtime {
     uring: IoUring,
     tasks: Slab<Task>,
+    backlog: LinkedList<Entry>,
 }
 
 impl Runtime {
@@ -19,6 +21,7 @@ impl Runtime {
         Ok(Self{
             uring: IoUring::new(size)?,
             tasks: Slab::with_capacity(size as _),
+            backlog: LinkedList::new(),
         })
     }
 
@@ -67,12 +70,18 @@ impl Runtime {
         let entry = entry.user_data(task_id as _).flags(flags);
 
         let mut available = self.uring.submission().available();
-        unsafe { 
-            match available.push(entry) {
-                Ok(_) => Ok(task_id),
-                Err(_) => anyhow::bail!("failed to push task"),
+        if available.is_full() {
+            self.backlog.push_back(entry);
+            println!("backlog size: {}", self.backlog.len());
+        } else {
+            unsafe { 
+                if let Err(_) = available.push(entry) {
+                    anyhow::bail!("failed to push task");
+                }
             }
         }
+
+        Ok(task_id)
     }
 
     pub fn wait(&mut self) -> Result<(usize, Task, Result<usize>)> {
@@ -87,6 +96,26 @@ impl Runtime {
         let ret = entry.result();
         let task_id = entry.user_data() as usize;
         let task = self.tasks.remove(task_id);
+
+        if !self.backlog.is_empty() {
+            let mut available = self.uring.submission().available();
+            let space = available.capacity() - available.len();
+
+            for _ in 0..space {
+                let entry = match self.backlog.pop_front() {
+                    Some(entry) => entry,
+                    None => break,
+                };
+
+                unsafe { 
+                    if let Err(_) = available.push(entry) {
+                        anyhow::bail!("failed to push backlog task");
+                    }
+                }
+            }
+
+            println!("backlog size: {}", self.backlog.len());
+        }
 
         let completion = if ret >= 0 {
            Ok(ret as usize)
