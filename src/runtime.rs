@@ -27,18 +27,18 @@ impl Runtime {
         self.run_flags(task, Flags::empty())
     }
 
-    /// Run the given task after the previous task has finished.
-    pub fn run_after(&mut self, task: Task) -> Result<usize> {
-        self.run_flags(task, Flags::IO_HARDLINK)
-    }
-
     /// Run the given task after the previous task has finished successfully.
-    pub fn run_after_ok(&mut self, task: Task) -> Result<usize> {
+    pub fn then_run(&mut self, task: Task) -> Result<usize> {
         self.run_flags(task, Flags::IO_LINK)
     }
 
+    /// Run the given task after the previous task has finished.
+    pub fn after_run(&mut self, task: Task) -> Result<usize> {
+        self.run_flags(task, Flags::IO_HARDLINK)
+    }
+
     /// Run the given task after all current tasks have finished and before any future tasks.
-    pub fn run_barrier(&mut self, task: Task) -> Result<usize> {
+    pub fn drain_then_run(&mut self, task: Task) -> Result<usize> {
         self.run_flags(task, Flags::IO_DRAIN)
     }
 
@@ -57,7 +57,8 @@ impl Runtime {
             Task::Read{ fd, ref mut buffer } => {
                 opcode::Read::new(types::Fd(fd), buffer.as_mut_ptr(), buffer.len() as _).build()
             },
-            Task::Write{ fd, ref mut buffer } => {
+            Task::Write{ fd, ref mut buffer, offset, size } => {
+                let buffer = &mut buffer[offset..offset+size];
                 opcode::Write::new(types::Fd(fd), buffer.as_mut_ptr(), buffer.len() as _).build()
             },
         };
@@ -74,7 +75,7 @@ impl Runtime {
         }
     }
 
-    pub fn wait(&mut self) -> Result<(usize, Task, Result<i32>)> {
+    pub fn wait(&mut self) -> Result<(usize, Task, Result<usize>)> {
         while self.uring.completion().is_empty() {
             self.uring.submitter().submit_and_wait(1)?;
         }
@@ -88,7 +89,7 @@ impl Runtime {
         let task = self.tasks.remove(task_id);
 
         let completion = if ret >= 0 {
-           Ok(ret)
+           Ok(ret as usize)
         } else {
            Err(anyhow!("{}", io::Error::from_raw_os_error(-ret)))
         };

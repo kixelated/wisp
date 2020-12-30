@@ -29,5 +29,7 @@ pub enum Task {
     Write {
         fd: RawFd, // write data to this file descriptor
         buffer: Box<[u8]>, // buffer that contains the data
+        offset: usize, // starting offset in the buffer
+        size: usize, // size to write
     },
 }
