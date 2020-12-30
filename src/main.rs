@@ -26,11 +26,9 @@ fn main() -> anyhow::Result<()> {
             Task::Close{..} => {
                 println!("closed");
             },
-            /*
-            Task::Connect => {
+            Task::Connect{..} => {
                 println!("todo");
             },
-            */
             Task::Read{ fd, buffer, .. } => {
                 let size = ret? as usize;
 

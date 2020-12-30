@@ -1,5 +1,5 @@
 use std::os::unix::io::RawFd;
-//use std::net::SocketAddr;
+use nix::sys::socket::SockAddr;
 
 #[derive(Debug)]
 pub enum Task {
@@ -14,12 +14,10 @@ pub enum Task {
     },
 
     // Dial a TCP connection to the given address.
-    /*
     Connect {
         fd: RawFd, 
-        addr: SocketAddr,
-    }
-    */
+        addr: SockAddr,
+    },
 
     // Read from a TCP stream.
     Read {

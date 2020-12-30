@@ -1,4 +1,5 @@
 use super::Task;
+
 use std::{io, ptr};
 
 use io_uring::IoUring;
@@ -49,30 +50,10 @@ impl Runtime {
             Task::Close { fd } => {
                 opcode::Close::new(types::Fd(fd)).build()
             },
-            /*
             Task::Connect{ fd, addr } => {
-                let socket_addr = match addr {
-                    V4(addr) => {
-                        libc::sockaddr_in{
-                           sin_family: libc::AF_INET,
-                           sin_port: addr.port(),
-                           sin_addr: addr.ip(),
-                        }
-                    },
-                    V6(addr) => {
-                        libc::sockaddr_in6{
-                            sin6_family: libc::AF_INET,
-                            sin6_port: addr.port(),
-                            sin6_flowinfo: addr.flowinfo(),
-                            sin6_addr: addr.ip(),
-                            sin6_scope_id: addr.scope_id(),
-                        }
-                    },
-                };
-
-                opcode::Connect::new(types::Fd(fd), sock_addr.as_ptr(), mem::size_of(sock_addr) as _).build()
+                let (addr, size) = addr.as_ffi_pair();
+                opcode::Connect::new(types::Fd(fd), addr, size).build()
             },
-            */
             Task::Read{ fd, ref mut buffer } => {
                 opcode::Read::new(types::Fd(fd), buffer.as_mut_ptr(), buffer.len() as _).build()
             },
