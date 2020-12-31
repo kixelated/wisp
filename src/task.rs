@@ -1,35 +1,35 @@
-use std::os::unix::io::RawFd;
-use nix::sys::socket::SockAddr;
+use std::net;
 
 #[derive(Debug)]
 pub enum Task {
     // Accept a TCP connection.
     Accept {
-        fd: RawFd,
+        socket: net::TcpListener,
     },
 
     // Close a socket.
     Close {
-        fd: RawFd,
+        socket: net::TcpStream,
     },
 
     // Dial a TCP connection to the given address.
     Connect {
-        fd: RawFd, 
-        addr: SockAddr,
+        socket: net::TcpStream,
+        //addr: SockAddr,
+        addr: net::SocketAddr,
     },
 
-    // Read from a TCP stream.
+    // Read from a TCP socket.
     Read {
-        fd: RawFd, // read data from this file descriptor
+        socket: net::TcpStream,         // read data from this file descriptor
         buffer: Box<[u8]>, // buffer that will contain the data
     },
 
-    // Write to a TCP stream.
+    // Write to a TCP socket.
     Write {
-        fd: RawFd, // write data to this file descriptor
+        socket: net::TcpStream,         // write data to this file descriptor
         buffer: Box<[u8]>, // buffer that contains the data
-        offset: usize, // starting offset in the buffer
-        size: usize, // size to write
+        offset: usize,
+        size: usize,
     },
 }

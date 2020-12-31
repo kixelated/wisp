@@ -1,5 +1,5 @@
-mod task;
 mod runtime;
+mod task;
 
-pub use task::Task;
 pub use runtime::Runtime;
+pub use task::Task;
