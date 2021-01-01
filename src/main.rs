@@ -24,7 +24,8 @@ enum State {
 }
 
 fn main() -> anyhow::Result<()> {
-    let mut io = Runtime::new(256)?;
+    let mut uring = io_uring::IoUring::new(1024)?;
+    let mut io = Runtime::new(&mut uring)?;
 
     let backend_addr: net::SocketAddr = "127.0.0.1:9001".parse()?;
     let frontend_addr: net::SocketAddr = "127.0.0.1:8080".parse()?;

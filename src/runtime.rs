@@ -9,17 +9,25 @@ use io_uring::IoUring;
 use anyhow::Result;
 use slab::Slab;
 
-pub struct Runtime {
-    uring: IoUring,
+pub struct Runtime<'a> {
+    submitter: io_uring::Submitter<'a>,
+    submissions: io_uring::squeue::AvailableQueue<'a>,
+    completions: io_uring::cqueue::AvailableQueue<'a>,
+
     tasks: Slab<TaskType>,
     backlog: LinkedList<Entry>,
 }
 
-impl Runtime {
-    pub fn new(size: u32) -> Result<Self> {
+impl<'a> Runtime<'a> {
+    pub fn new(uring: &'a mut IoUring) -> Result<Self> {
+        let (submitter, submissions, completions) = uring.split();
+
         Ok(Self {
-            uring: IoUring::new(size)?,
-            tasks: Slab::with_capacity(size as _),
+            submitter,
+            submissions: submissions.available(),
+            completions: completions.available(),
+
+            tasks: Slab::new(),
             backlog: LinkedList::new(),
         })
     }
@@ -50,15 +58,17 @@ impl Runtime {
         let task_id = self.tasks.insert(task);
         let entry = entry.user_data(task_id as _).flags(flags);
 
-        let mut available = self.uring.submission().available();
-        if available.is_full() {
-            self.backlog.push_back(entry);
-            //println!("backlog size: {}", self.backlog.len());
-        } else {
-            unsafe {
-                if available.push(entry).is_err() {
-                    anyhow::bail!("failed to push task");
-                }
+        if self.submissions.is_full() {
+            self.submissions.sync();
+            if self.submissions.is_full() {
+                self.backlog.push_back(entry);
+                return Ok(task_id)
+            }
+        }
+
+        unsafe {
+            if self.submissions.push(entry).is_err() {
+                anyhow::bail!("failed to push task");
             }
         }
 
@@ -66,39 +76,51 @@ impl Runtime {
     }
 
     pub fn wait(&mut self) -> Result<(usize, CompletionType)> {
-        while self.uring.completion().is_empty() {
-            self.uring.submitter().submit_and_wait(1)?;
-        }
-
-        let available = self.uring.completion().available();
-
-        let entry = available.into_iter().next().unwrap();
+        let entry = match self.completions.next() {
+            Some(e) => e,
+            None => {
+                self.completions.sync();
+                match self.completions.next() {
+                    Some(e) => e,
+                    None => {
+                        self.submitter.submit_and_wait(1)?;
+                        self.completions.sync();
+                        self.completions.next().unwrap()
+                    },
+                }
+            },
+        };
 
         let ret = entry.result();
         let task_id = entry.user_data() as usize;
         let task = self.tasks.remove(task_id);
         let completion = CompletionType::new(task, ret);
 
-        if !self.backlog.is_empty() {
-            let mut available = self.uring.submission().available();
-            let space = available.capacity() - available.len();
-
-            for _ in 0..space {
-                let entry = match self.backlog.pop_front() {
-                    Some(entry) => entry,
-                    None => break,
-                };
-
-                unsafe {
-                    if available.push(entry).is_err() {
-                        anyhow::bail!("failed to push backlog task");
-                    }
-                }
-            }
-
-            //println!("backlog size: {}", self.backlog.len());
-        }
+        self.run_backlog()?;
 
         Ok((task_id, completion))
+    }
+
+    pub fn run_backlog(&mut self) -> Result<()> {
+        if self.backlog.is_empty() {
+            return Ok(())
+        }
+
+        self.submissions.sync();
+
+        while !self.submissions.is_full() {
+            let entry = match self.backlog.pop_front() {
+                Some(entry) => entry,
+                None => return Ok(()),
+            };
+
+            unsafe {
+                if self.submissions.push(entry).is_err() {
+                    anyhow::bail!("failed to push backlog task");
+                }
+            }
+        }
+
+        return Ok(())
     }
 }
