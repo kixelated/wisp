@@ -1,127 +1,131 @@
-use std::net;
 use std::collections::HashMap;
+use std::os::unix::io::FromRawFd;
+use std::net;
 
-use wisp::{Runtime};
-use wisp::{task};
-use wisp::completion::CompletionType;
+use wisp::kio::completion::CompletionType;
+use wisp::kio::{Kio,tcp};
 
-enum State {
-    Connecting {
-        frontend: net::TcpStream,
-    },
-    ReadRequest {
-        backend: net::TcpStream,
-    },
-    WriteRequest {
-        frontend: net::TcpStream,
-    },
-    ReadResponse {
-        frontend: net::TcpStream,
-    },
-    WriteResponse {
-        backend: net::TcpStream,
-    },
+use nix::sys::socket;
+
+use slab::Slab;
+
+struct Pipe {
+    reader: Option<tcp::Reader>,
+    writer: Option<tcp::Writer>,
+    buffer: Option<Box<[u8]>>,
 }
 
 fn main() -> anyhow::Result<()> {
     let mut uring = io_uring::IoUring::new(1024)?;
-    let mut io = Runtime::new(&mut uring)?;
+    let mut kio = Kio::new(&mut uring)?;
 
     let backend_addr: net::SocketAddr = "127.0.0.1:9001".parse()?;
     let frontend_addr: net::SocketAddr = "127.0.0.1:8080".parse()?;
 
-    let accept = net::TcpListener::bind(frontend_addr)?;
-    println!("listen {}", accept.local_addr()?);
+    let listener = net::TcpListener::bind(frontend_addr)?;
+    println!("listen {}", listener.local_addr()?);
 
-    io.run(task::Accept::new(accept).into())?;
+    kio.accept(listener);
 
-    let mut connections = HashMap::new();
+    let mut tasks = HashMap::new(); // TODO replace with some form of vector
+    let mut pipes = Slab::new();
 
     loop {
-        let (id, completion) = io.wait()?;
+        let (task_id, completion) = kio.wait()?;
 
         match completion {
             CompletionType::Accept(accept) => {
                 let frontend = accept.socket?;
 
-                // Connect to the backend
-                io.run(task::Connect::new(backend_addr)?.into())?;
+                // Create a new IPv4 TCP socket.
+                // We need to use the nix package because there's no way to do this in the stdlib.
+                let backend_fd = socket::socket(
+                    socket::AddressFamily::Inet, // TODO support ipv6
+                    socket::SockType::Stream,
+                    socket::SockFlag::empty(),
+                    socket::SockProtocol::Tcp,
+                )?;
 
-                connections.insert(id, State::Connecting{frontend});
+                let backend = unsafe { net::TcpStream::from_raw_fd(backend_fd) };
+
+                let (frontend_reader, frontend_writer) = tcp::split(frontend);
+                let (backend_reader, backend_writer) = tcp::split(backend);
+
+                let incoming = Pipe {
+                    reader: None,
+                    writer: Some(backend_writer),
+                    buffer: Some(vec![0u8; 2048].into_boxed_slice()),
+                };
+
+                let outgoing = Pipe {
+                    reader: None,
+                    writer: Some(frontend_writer),
+                    buffer: Some(vec![0u8; 4096].into_boxed_slice()),
+                };
+
+                let outgoing_id = pipes.insert(outgoing);
+                let incoming_id = pipes.insert(incoming);
+
+                let buffer = vec![0u8; 2048].into_boxed_slice();
+
+                // Connect to the backend first.
+                //tasks.insert(kio.timeout(time::Duration::from_secs(5)), outgoing_id);
+                tasks.insert(kio.connect_then(backend_reader, backend_addr), outgoing_id);
+                //tasks.insert(kio.timeout(time::Duration::from_secs(5)), incoming_id);
+                tasks.insert(kio.read(frontend_reader, buffer), incoming_id);
 
                 // Queue up the accept again.
-                io.run(accept.task.into())?;
-            },
+                kio.accept(accept.task.socket);
+            }
             CompletionType::Connect(connect) => {
-                let state = connections.remove(&id);
+                let pipe_id = tasks.remove(&task_id).unwrap();
 
                 if let Err(err) = connect.result {
                     println!("failed to connect to backend: {:?}", err);
                     continue;
                 }
 
-                let frontend = match state {
-                    Some(State::Connecting{ frontend }) => frontend,
-                    Some(_) => anyhow::bail!("unexpected state"),
-                    None => anyhow::bail!("no task in lookup"),
-                };
+                //println!("connected to backend: {}", pipe_id);
 
-                let task = connect.task;
-                let backend = task.socket;
                 let buffer = vec![0u8; 4096].into_boxed_slice();
-
-                let id = io.run(task::Read::new(frontend, buffer).into())?;
-                connections.insert(id, State::ReadRequest{backend});
-            },
+                //tasks.insert(kio.timeout(time::Duration::from_secs(10)), pipe_id);
+                tasks.insert(kio.read(connect.task.socket, buffer), pipe_id);
+            }
             CompletionType::Read(read) => {
-                let state = connections.remove(&id);
+                let pipe_id = tasks.remove(&task_id).unwrap();
 
                 let size = match read.size {
                     Ok(size) => size,
                     Err(err) => {
+                        // TODO
+                        // pipe.reader.replace(read.task.socket);
+                        // pipe.buffer.replace(read.task.buffer);
                         println!("failed to read: {}", err);
                         continue;
                     }
                 };
 
-                let task = read.task;
-                let (socket, buffer) = (task.socket, task.buffer);
+                //println!("read: {} {}", pipe_id, size);
 
                 if size == 0 {
-                    match state {
-                        Some(State::ReadRequest{backend}) => {
-                            backend.shutdown(net::Shutdown::Write)?;
-
-                            let id = io.run(task::Read::new(backend, buffer).into())?;
-                            connections.insert(id, State::ReadResponse{frontend: socket});
-                        },
-                        Some(State::ReadResponse{frontend}) => {
-                            frontend.shutdown(net::Shutdown::Write)?;
-
-                            // closed, both sockets are dropped
-                        },
-                        Some(_) => anyhow::bail!("unexpected state"),
-                        None => anyhow::bail!("no task in lookup"),
-                    }
+                    pipes.remove(pipe_id);
+                //println!("closing: {}", pipe_id);
                 } else {
-                    match state {
-                        Some(State::ReadRequest{backend}) => {
-                            let id = io.run(task::Write::new(backend, buffer, 0..size).into())?;
-                            connections.insert(id, State::WriteRequest{frontend: socket});
-                        },
-                        Some(State::ReadResponse{frontend}) => {
-                            let id = io.run(task::Write::new(frontend, buffer, 0..size).into())?;
-                            connections.insert(id, State::WriteResponse{backend: socket});
-                        },
-                        Some(_) => anyhow::bail!("unexpected state"),
-                        None => anyhow::bail!("no task in lookup"),
-                    }
+                    let pipe = pipes.get_mut(pipe_id).unwrap();
+
+                    let writer = pipe.writer.take().unwrap();
+                    let buffer = pipe.buffer.take().unwrap();
+
+                    //tasks.insert(kio.timeout(time::Duration::from_secs(5)), pipe_id);
+                    tasks.insert(kio.write_then(writer, read.task.buffer, 0..size), pipe_id);
+                    //tasks.insert(kio.timeout(time::Duration::from_secs(5)), pipe_id);
+                    tasks.insert(kio.read(read.task.socket, buffer), pipe_id);
                 }
             }
             CompletionType::Write(write) => {
-                let state = connections.remove(&id);
+                let pipe_id = tasks.remove(&task_id).unwrap();
 
-                let written = match write.size {
+                let size = match write.size {
                     Ok(size) => size,
                     Err(err) => {
                         println!("failed to write: {}", err);
@@ -129,29 +133,42 @@ fn main() -> anyhow::Result<()> {
                     }
                 };
 
-                let task = write.task;
-                let (socket, buffer, range) = (task.socket, task.buffer, task.range);
+                //println!("write: {} {}", pipe_id, size);
 
-                if written == range.end - range.start {
-                    match state {
-                        Some(State::WriteRequest{frontend}) => {
-                            io.run(task::Read::new(frontend, buffer).into())?;
-                            connections.insert(id, State::ReadRequest{backend: socket});
-                        },
-                        Some(State::WriteResponse{backend}) => {
-                            let id = io.run(task::Read::new(backend, buffer).into())?;
-                            connections.insert(id, State::ReadResponse{frontend: socket});
-                        },
-                        Some(_) => anyhow::bail!("unexpected state"),
-                        None => anyhow::bail!("no task in lookup"),
+                let pipe = pipes.get_mut(pipe_id).unwrap();
+                let task = write.task;
+
+                if size == task.end - task.start {
+                    pipe.writer.replace(task.socket);
+
+                    if let Some(reader) = pipe.reader.take() {
+                        //tasks.insert(kio.timeout(time::Duration::from_secs(5)), pipe_id);
+                        kio.read(reader, task.buffer);
+                    } else {
+                        pipe.buffer.replace(task.buffer);
                     }
                 } else {
-                    let id = io.run(task::Write::new(socket, buffer, range.start+written..range.end).into())?;
-                    match state {
-                        Some(state) => connections.insert(id, state),
-                        None => anyhow::bail!("no task in lookup"),
-                    };
+                    // Continue writing the rest of data.
+                    //tasks.insert(kio.timeout(time::Duration::from_secs(5)), pipe_id);
+                    tasks.insert(
+                        kio.write(task.socket, task.buffer, task.start + size..task.end),
+                        pipe_id,
+                    );
                 }
+            }
+            CompletionType::Timeout(timeout) => {
+                let _pipe_id = tasks.remove(&task_id).unwrap();
+
+                if let Err(err) = timeout.result {
+                    println!("failed to timeout: {}", err);
+                    // TODO close pipe
+                    continue;
+                }
+
+                //println!("timeout finished");
+            }
+            _ => {
+                panic!("unknown completion")
             }
         }
     }

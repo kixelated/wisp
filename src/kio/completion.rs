@@ -1,5 +1,5 @@
-use std::{io, net};
 use std::os::unix::io::FromRawFd;
+use std::{io, net};
 
 use enum_dispatch::enum_dispatch;
 
@@ -13,12 +13,29 @@ pub struct Accept {
 impl Accept {
     pub fn new(task: task::Accept, ret: i32) -> Self {
         let socket = if ret >= 0 {
-            Ok(unsafe{net::TcpStream::from_raw_fd(ret)})
+            Ok(unsafe { net::TcpStream::from_raw_fd(ret) })
         } else {
             Err(io::Error::from_raw_os_error(-ret))
         };
 
-        Self{task, socket}
+        Self { task, socket }
+    }
+}
+
+pub struct Cancel {
+    pub task: task::Cancel,
+    pub result: Result<(), io::Error>,
+}
+
+impl Cancel {
+    pub fn new(task: task::Cancel, ret: i32) -> Self {
+        let result = if ret >= 0 || ret == -libc::EALREADY {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(-ret))
+        };
+
+        Self { task, result }
     }
 }
 
@@ -35,7 +52,7 @@ impl Connect {
             Err(io::Error::from_raw_os_error(-ret))
         };
 
-        Self{task, result}
+        Self { task, result }
     }
 }
 
@@ -52,7 +69,24 @@ impl Read {
             Err(io::Error::from_raw_os_error(-ret))
         };
 
-        Self{task, size}
+        Self { task, size }
+    }
+}
+
+pub struct Timeout {
+    pub task: task::Timeout,
+    pub result: Result<(), io::Error>,
+}
+
+impl Timeout {
+    pub fn new(task: task::Timeout, ret: i32) -> Self {
+        let result = if ret >= 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(-ret))
+        };
+
+        Self { task, result }
     }
 }
 
@@ -69,27 +103,28 @@ impl Write {
             Err(io::Error::from_raw_os_error(-ret))
         };
 
-        Self{task, size}
+        Self { task, size }
     }
 }
 
 #[enum_dispatch]
-pub trait Completion {}
-
-#[enum_dispatch(Completion)]
 pub enum CompletionType {
-    Accept(Accept),
-    Connect(Connect),
-    Read(Read),
-    Write(Write),
+    Accept,
+    Cancel,
+    Connect,
+    Read,
+    Timeout,
+    Write,
 }
 
 impl CompletionType {
     pub fn new(task: task::TaskType, ret: i32) -> Self {
         match task {
             task::TaskType::Accept(task) => CompletionType::Accept(Accept::new(task, ret)),
+            task::TaskType::Cancel(task) => CompletionType::Cancel(Cancel::new(task, ret)),
             task::TaskType::Connect(task) => CompletionType::Connect(Connect::new(task, ret)),
             task::TaskType::Read(task) => CompletionType::Read(Read::new(task, ret)),
+            task::TaskType::Timeout(task) => CompletionType::Timeout(Timeout::new(task, ret)),
             task::TaskType::Write(task) => CompletionType::Write(Write::new(task, ret)),
         }
     }
