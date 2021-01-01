@@ -1,217 +1,155 @@
 use std::net;
-use std::rc::Rc;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::collections::HashMap;
 
-use nix::sys::socket;
+use wisp::{Runtime};
+use wisp::{task};
+use wisp::completion::CompletionType;
 
-use wisp::{Runtime, Task};
-
-enum Socket {
-    Backend { frontend: net::TcpStream },
-    Frontend { backend: net::TcpStream },
+enum State {
+    Connecting {
+        frontend: net::TcpStream,
+    },
+    ReadRequest {
+        backend: net::TcpStream,
+    },
+    WriteRequest {
+        frontend: net::TcpStream,
+    },
+    ReadResponse {
+        frontend: net::TcpStream,
+    },
+    WriteResponse {
+        backend: net::TcpStream,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
     let mut io = Runtime::new(256)?;
 
-    let backend_addr: net::SocketAddr = "127.0.0.1:9001".parse().unwrap();
-    let frontend_addr: net::SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    let backend_addr: net::SocketAddr = "127.0.0.1:9001".parse()?;
+    let frontend_addr: net::SocketAddr = "127.0.0.1:8080".parse()?;
 
     let accept = net::TcpListener::bind(frontend_addr)?;
     println!("listen {}", accept.local_addr()?);
 
-    io.run(Task::Accept { socket: accept })?;
+    io.run(task::Accept::new(accept).into())?;
 
-    let mut sockets = HashMap::new();
+    let mut connections = HashMap::new();
 
     loop {
-        let (_id, task, ret) = io.wait()?;
+        let (id, completion) = io.wait()?;
 
-        match task {
-            Task::Accept { .. } => {
-                let frontend = ret? as RawFd;
-                let frontend = unsafe { net::TcpStream::from_raw_fd(frontend) };
+        match completion {
+            CompletionType::Accept(accept) => {
+                let frontend = accept.socket?;
 
-                // Queue up the next accept.
-                io.run(Task::Accept { socket: accept })?;
+                // Connect to the backend
+                io.run(task::Connect::new(backend_addr)?.into())?;
 
-                // Create a new IPv4 TCP socket.
-                // We need to use the nix package because there's no way to do this in the stdlib.
-                let backend = socket::socket(
-                    socket::AddressFamily::Inet,
-                    socket::SockType::Stream,
-                    socket::SockFlag::empty(),
-                    socket::SockProtocol::Tcp,
-                )?;
-                let backend = unsafe { net::TcpStream::from_raw_fd(backend) };
+                connections.insert(id, State::Connecting{frontend});
 
-                sockets.insert(frontend.as_raw_fd(), Socket::Frontend { backend });
-                sockets.insert(backend.as_raw_fd(), Socket::Backend { frontend });
-
-                //let addr = socket::InetAddr::from_std(&backend_addr);
-                //let addr = socket::SockAddr::Inet(addr);
-
-                io.run(Task::Connect {
-                    socket: backend,
-                    addr: backend_addr,
-                })?;
+                // Queue up the accept again.
+                io.run(accept.task.into())?;
             },
-            Task::Close { socket } => {
-                if let Err(err) = ret {
-                    println!("failed to close socket: {:?}", err);
-                }
+            CompletionType::Connect(connect) => {
+                let state = connections.remove(&id);
 
-                let fd = socket.as_raw_fd();
-                sockets.remove(&fd);
-            },
-            Task::Connect { socket, .. } => {
-                let fd = socket.as_raw_fd();
-
-                let (frontend, backend) = match sockets.get(&fd) {
-                    Some(Socket::Backend { frontend }) => (*frontend, socket),
-                    Some(Socket::Frontend { .. }) => anyhow::bail!("impossible frontend in lookup"),
-                    None => continue, // closed
-                };
-
-                if let Err(err) = ret {
+                if let Err(err) = connect.result {
                     println!("failed to connect to backend: {:?}", err);
-
-                    // Close the frontend socket on a backend connection failure.
-                    io.run(Task::Close { socket: frontend })?;
-                    io.run(Task::Close { socket: backend })?;
-
                     continue;
                 }
 
-                let backend_buffer = vec![0u8; 4096].into_boxed_slice();
-                let frontend_buffer = vec![0u8; 4096].into_boxed_slice();
-
-                io.run(Task::Read {
-                    socket: frontend,
-                    buffer: frontend_buffer,
-                })?;
-
-                io.run(Task::Read {
-                    socket: backend,
-                    buffer: backend_buffer,
-                })?;
-            },
-            Task::Read { socket, buffer } => {
-                let fd = socket.as_raw_fd();
-
-                let (is_frontend, frontend, backend) = match sockets.get(&fd) {
-                    Some(Socket::Backend { frontend }) => (false, *frontend, socket),
-                    Some(Socket::Frontend { backend }) => (true, socket, *backend),
-                    None => continue, // closed
+                let frontend = match state {
+                    Some(State::Connecting{ frontend }) => frontend,
+                    Some(_) => anyhow::bail!("unexpected state"),
+                    None => anyhow::bail!("no task in lookup"),
                 };
 
-                let size = match ret {
+                let task = connect.task;
+                let backend = task.socket;
+                let buffer = vec![0u8; 4096].into_boxed_slice();
+
+                let id = io.run(task::Read::new(frontend, buffer).into())?;
+                connections.insert(id, State::ReadRequest{backend});
+            },
+            CompletionType::Read(read) => {
+                let state = connections.remove(&id);
+
+                let size = match read.size {
                     Ok(size) => size,
                     Err(err) => {
-                        if is_frontend {
-                            println!("failed to read from frontend: {}", err);
-                        } else {
-                            println!("failed to read from backend: {}", err);
-                        }
-
-                        io.run(Task::Close { socket: frontend })?;
-                        io.run(Task::Close { socket: backend })?;
-
+                        println!("failed to read: {}", err);
                         continue;
                     }
                 };
+
+                let task = read.task;
+                let (socket, buffer) = (task.socket, task.buffer);
 
                 if size == 0 {
-                    if is_frontend {
-                        let shutdown = socket::shutdown(backend.as_raw_fd(), socket::Shutdown::Write);
-                        if let Err(err) = shutdown {
-                            println!("failed to send shutdown to backend: {}", err);
+                    match state {
+                        Some(State::ReadRequest{backend}) => {
+                            backend.shutdown(net::Shutdown::Write)?;
 
-                            io.run(Task::Close { socket: frontend })?;
-                            io.run(Task::Close { socket: backend })?;
-                        }
+                            let id = io.run(task::Read::new(backend, buffer).into())?;
+                            connections.insert(id, State::ReadResponse{frontend: socket});
+                        },
+                        Some(State::ReadResponse{frontend}) => {
+                            frontend.shutdown(net::Shutdown::Write)?;
 
-                        continue;
-                    } else {
-                        let shutdown = socket::shutdown(frontend.as_raw_fd(), socket::Shutdown::Write);
-                        if let Err(err) = shutdown {
-                            println!("failed to send shutdown to frontend: {}", err);
-                        }
-
-                        // We're done when the backend is done transferring the response.
-                        io.run(Task::Close { socket: frontend })?;
-                        io.run(Task::Close { socket: backend })?;
-
-                        continue;
+                            // closed, both sockets are dropped
+                        },
+                        Some(_) => anyhow::bail!("unexpected state"),
+                        None => anyhow::bail!("no task in lookup"),
                     }
-                }
-
-                if is_frontend {
-                    io.run(Task::Write {
-                        socket: backend,
-                        buffer,
-                        offset: 0,
-                        size,
-                    })?;
                 } else {
-                    io.run(Task::Write {
-                        socket: frontend,
-                        buffer,
-                        offset: 0,
-                        size,
-                    })?;
+                    match state {
+                        Some(State::ReadRequest{backend}) => {
+                            let id = io.run(task::Write::new(backend, buffer, 0..size).into())?;
+                            connections.insert(id, State::WriteRequest{frontend: socket});
+                        },
+                        Some(State::ReadResponse{frontend}) => {
+                            let id = io.run(task::Write::new(frontend, buffer, 0..size).into())?;
+                            connections.insert(id, State::WriteResponse{backend: socket});
+                        },
+                        Some(_) => anyhow::bail!("unexpected state"),
+                        None => anyhow::bail!("no task in lookup"),
+                    }
                 }
             }
-            Task::Write {
-                socket,
-                buffer,
-                offset,
-                size,
-            } => {
-                let fd = socket.as_raw_fd();
+            CompletionType::Write(write) => {
+                let state = connections.remove(&id);
 
-                let (is_frontend, frontend, backend) = match sockets.get(&fd) {
-                    Some(Socket::Backend { frontend }) => (false, *frontend, socket),
-                    Some(Socket::Frontend { backend }) => (true, socket, *backend),
-                    None => continue, // closed
-                };
-
-                let written = match ret {
+                let written = match write.size {
                     Ok(size) => size,
                     Err(err) => {
-                        if is_frontend {
-                            println!("failed to write to frontend: {}", err);
-                        } else {
-                            println!("failed to write to backend: {}", err);
-                        }
-
-                        io.run(Task::Close { socket: frontend })?;
-                        io.run(Task::Close { socket: backend })?;
-
+                        println!("failed to write: {}", err);
                         continue;
                     }
                 };
 
-                if written == size {
-                    if is_frontend {
-                        io.run(Task::Read {
-                            socket: backend,
-                            buffer,
-                        })?;
-                    } else {
-                        io.run(Task::Read {
-                            socket: frontend,
-                            buffer,
-                        })?;
+                let task = write.task;
+                let (socket, buffer, range) = (task.socket, task.buffer, task.range);
+
+                if written == range.end - range.start {
+                    match state {
+                        Some(State::WriteRequest{frontend}) => {
+                            io.run(task::Read::new(frontend, buffer).into())?;
+                            connections.insert(id, State::ReadRequest{backend: socket});
+                        },
+                        Some(State::WriteResponse{backend}) => {
+                            let id = io.run(task::Read::new(backend, buffer).into())?;
+                            connections.insert(id, State::ReadResponse{frontend: socket});
+                        },
+                        Some(_) => anyhow::bail!("unexpected state"),
+                        None => anyhow::bail!("no task in lookup"),
                     }
                 } else {
-                    io.run(Task::Write {
-                        socket,
-                        buffer,
-                        offset: offset + size,
-                        size: size - written,
-                    })?;
+                    let id = io.run(task::Write::new(socket, buffer, range.start+written..range.end).into())?;
+                    match state {
+                        Some(state) => connections.insert(id, state),
+                        None => anyhow::bail!("no task in lookup"),
+                    };
                 }
             }
         }
