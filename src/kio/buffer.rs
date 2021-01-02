@@ -1,7 +1,31 @@
-use std::ops;
 use std::collections::LinkedList;
+use std::ops;
 
-pub type Slice = Box<[u8]>;
+pub struct Slice {
+    data: Box<[u8]>,
+}
+
+impl Slice {
+    pub fn new(size: usize) -> Self {
+        Self {
+            data: vec![0; size].into_boxed_slice(),
+        }
+    }
+}
+
+impl ops::Deref for Slice {
+    type Target = Box<[u8]>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.data
+    }
+}
+
+impl ops::DerefMut for Slice {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.data
+    }
+}
 
 pub struct Fixed {
     id: usize,
@@ -10,7 +34,10 @@ pub struct Fixed {
 
 impl Fixed {
     pub fn new(id: usize, size: usize) -> Self {
-        Self{id, data: vec![0; size].into_boxed_slice()}
+        Self {
+            id,
+            data: Slice::new(size),
+        }
     }
 
     pub fn id(&self) -> usize {
@@ -37,10 +64,6 @@ pub struct Pool {
 }
 
 impl Pool {
-    pub fn new() -> Self {
-        Self{buffers: LinkedList::new()}
-    }
-
     pub fn give(&mut self, buffer: Fixed) {
         self.buffers.push_back(buffer);
     }
@@ -49,5 +72,13 @@ impl Pool {
         // Take from the back because it's more likely to be cached?
         // TODO benchmark
         self.buffers.pop_back()
+    }
+}
+
+impl Default for Pool {
+    fn default() -> Self {
+        Self {
+            buffers: LinkedList::new(),
+        }
     }
 }

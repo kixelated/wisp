@@ -6,7 +6,7 @@ use io_uring::squeue::Entry;
 
 use enum_dispatch::enum_dispatch;
 
-use super::{tcp,buffer};
+use super::{buffer, tcp};
 
 // Accept a TCP connection.
 pub struct Accept {
@@ -70,8 +70,8 @@ impl Task for Connect {
 
 // Read from a TCP socket.
 pub struct Read {
-    pub socket: tcp::Reader, // read data from this file descriptor
-    pub buffer: buffer::Slice,   // buffer that will contain the data
+    pub socket: tcp::Reader,   // read data from this file descriptor
+    pub buffer: buffer::Slice, // buffer that will contain the data
 }
 
 impl Task for Read {
@@ -86,8 +86,8 @@ impl Task for Read {
 }
 
 pub struct ReadFixed {
-    pub socket: tcp::Reader, // read data from this file descriptor
-    pub buffer: buffer::Fixed,   // buffer that will contain the data
+    pub socket: tcp::Reader,   // read data from this file descriptor
+    pub buffer: buffer::Fixed, // buffer that will contain the data
 }
 
 impl Task for ReadFixed {
@@ -125,8 +125,8 @@ impl Task for Timeout {
 
 // Write to a TCP socket.
 pub struct Write {
-    pub socket: tcp::Writer, // write data to this file descriptor
-    pub buffer: buffer::Slice,   // buffer that contains the data
+    pub socket: tcp::Writer,   // write data to this file descriptor
+    pub buffer: buffer::Slice, // buffer that contains the data
     pub start: usize,
     pub end: usize,
 }
@@ -148,7 +148,12 @@ impl Write {
             ops::Bound::Unbounded => buffer.len(),
         };
 
-        Self {socket, buffer, start, end }
+        Self {
+            socket,
+            buffer,
+            start,
+            end,
+        }
     }
 }
 
@@ -160,14 +165,15 @@ impl Task for Write {
             types::Fd(self.socket.as_raw_fd()),
             buffer.as_mut_ptr(),
             buffer.len() as _,
-        ).build()
+        )
+        .build()
     }
 }
 
 // Write to a TCP socket.
 pub struct WriteFixed {
-    pub socket: tcp::Writer, // write data to this file descriptor
-    pub buffer: buffer::Fixed,   // buffer that contains the data
+    pub socket: tcp::Writer,   // write data to this file descriptor
+    pub buffer: buffer::Fixed, // buffer that contains the data
     pub start: usize,
     pub end: usize,
 }
@@ -189,7 +195,12 @@ impl WriteFixed {
             ops::Bound::Unbounded => buffer.len(),
         };
 
-        Self {socket, buffer, start, end}
+        Self {
+            socket,
+            buffer,
+            start,
+            end,
+        }
     }
 }
 
@@ -203,7 +214,8 @@ impl Task for WriteFixed {
             buffer.as_mut_ptr(),
             buffer.len() as _,
             id as _,
-        ).build()
+        )
+        .build()
     }
 }
 

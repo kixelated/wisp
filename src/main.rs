@@ -1,9 +1,9 @@
 use std::collections::HashMap;
-use std::os::unix::io::FromRawFd;
 use std::net;
+use std::os::unix::io::FromRawFd;
 
 use wisp::kio::completion::CompletionType;
-use wisp::kio::{Kio,tcp,buffer};
+use wisp::kio::{buffer, tcp, Kio};
 
 use nix::sys::socket;
 
@@ -12,7 +12,7 @@ use slab::Slab;
 struct Pipe {
     reader: Option<tcp::Reader>,
     writer: Option<tcp::Writer>,
-    buffer: Option<buffer::Fixed>,
+    buffer: Option<buffer::Slice>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -54,8 +54,8 @@ fn main() -> anyhow::Result<()> {
                 let (frontend_reader, frontend_writer) = tcp::split(frontend);
                 let (backend_reader, backend_writer) = tcp::split(backend);
 
-                let incoming_buffer = kio.buffers().take().expect("out of buffers");
-                let outgoing_buffer = kio.buffers().take().expect("out of buffers");
+                let incoming_buffer = buffer::Slice::new(1024);
+                let outgoing_buffer = buffer::Slice::new(4096);
 
                 let incoming = Pipe {
                     reader: None,
@@ -72,13 +72,13 @@ fn main() -> anyhow::Result<()> {
                 let outgoing_id = pipes.insert(outgoing);
                 let incoming_id = pipes.insert(incoming);
 
-                let buffer = kio.buffers().take().expect("out of buffers");
+                let buffer = buffer::Slice::new(1024);
 
                 // Connect to the backend first.
                 //tasks.insert(kio.timeout(time::Duration::from_secs(5)), outgoing_id);
                 tasks.insert(kio.connect_then(backend_reader, backend_addr), outgoing_id);
                 //tasks.insert(kio.timeout(time::Duration::from_secs(5)), incoming_id);
-                tasks.insert(kio.read_fixed(frontend_reader, buffer), incoming_id);
+                tasks.insert(kio.read(frontend_reader, buffer), incoming_id);
 
                 // Queue up the accept again.
                 kio.accept(accept.task.socket);
@@ -93,21 +93,18 @@ fn main() -> anyhow::Result<()> {
 
                 //println!("connected to backend: {}", pipe_id);
 
-                let buffer = kio.buffers().take().expect("out of buffers");
+                let buffer = buffer::Slice::new(4096);
 
                 //tasks.insert(kio.timeout(time::Duration::from_secs(10)), pipe_id);
-                tasks.insert(kio.read_fixed(connect.task.socket, buffer), pipe_id);
+                tasks.insert(kio.read(connect.task.socket, buffer), pipe_id);
             }
-            CompletionType::ReadFixed(read) => {
+            CompletionType::Read(read) => {
                 let task = read.task;
 
                 let pipe_id = tasks.remove(&task_id).unwrap();
                 let pipe = match pipes.get_mut(pipe_id) {
                     Some(pipe) => pipe,
-                    None => {
-                        kio.buffers().give(task.buffer);
-                        continue
-                    },
+                    None => continue,
                 };
 
                 let size = match read.size {
@@ -115,12 +112,6 @@ fn main() -> anyhow::Result<()> {
                     Err(err) => {
                         // TODO
                         println!("failed to read: {}", err);
-
-                        kio.buffers().give(task.buffer);
-                        if let Some(buffer) = pipe.buffer.take() {
-                            kio.buffers().give(buffer);
-                        }
-
                         pipes.remove(pipe_id);
 
                         continue;
@@ -130,11 +121,6 @@ fn main() -> anyhow::Result<()> {
                 //println!("read: {} {}", pipe_id, size);
 
                 if size == 0 {
-                    kio.buffers().give(task.buffer);
-                    if let Some(buffer) = pipe.buffer.take() {
-                        kio.buffers().give(buffer);
-                    }
-
                     pipes.remove(pipe_id);
                 //println!("closing: {}", pipe_id);
                 } else {
@@ -142,35 +128,25 @@ fn main() -> anyhow::Result<()> {
                     let buffer = pipe.buffer.take().unwrap();
 
                     //tasks.insert(kio.timeout(time::Duration::from_secs(5)), pipe_id);
-                    tasks.insert(kio.write_fixed_then(writer, task.buffer, 0..size), pipe_id);
+                    tasks.insert(kio.write_then(writer, task.buffer, 0..size), pipe_id);
                     //tasks.insert(kio.timeout(time::Duration::from_secs(5)), pipe_id);
-                    tasks.insert(kio.read_fixed(task.socket, buffer), pipe_id);
+                    tasks.insert(kio.read(task.socket, buffer), pipe_id);
                 }
             }
-            CompletionType::WriteFixed(write) => {
+            CompletionType::Write(write) => {
                 let task = write.task;
 
                 let pipe_id = tasks.remove(&task_id).unwrap();
                 let pipe = match pipes.get_mut(pipe_id) {
                     Some(pipe) => pipe,
-                    None => {
-                        kio.buffers().give(task.buffer);
-                        continue;
-                    },
+                    None => continue,
                 };
 
                 let size = match write.size {
                     Ok(size) => size,
                     Err(err) => {
                         println!("failed to write: {}", err);
-
-                        kio.buffers().give(task.buffer);
-                        if let Some(buffer) = pipe.buffer.take() {
-                            kio.buffers().give(buffer);
-                        }
-
                         pipes.remove(pipe_id);
-
                         continue;
                     }
                 };
@@ -182,14 +158,17 @@ fn main() -> anyhow::Result<()> {
 
                     if let Some(reader) = pipe.reader.take() {
                         //tasks.insert(kio.timeout(time::Duration::from_secs(5)), pipe_id);
-                        kio.read_fixed(reader, task.buffer);
+                        kio.read(reader, task.buffer);
                     } else {
                         pipe.buffer.replace(task.buffer);
                     }
                 } else {
                     // Continue writing the rest of data.
                     //tasks.insert(kio.timeout(time::Duration::from_secs(5)), pipe_id);
-                    tasks.insert(kio.write_fixed(task.socket, task.buffer, task.start + size..task.end), pipe_id);
+                    tasks.insert(
+                        kio.write(task.socket, task.buffer, task.start + size..task.end),
+                        pipe_id,
+                    );
                 }
             }
             CompletionType::Timeout(timeout) => {
