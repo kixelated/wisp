@@ -6,7 +6,7 @@ use io_uring::squeue::Entry;
 
 use enum_dispatch::enum_dispatch;
 
-use super::tcp;
+use super::{tcp,buffer};
 
 // Accept a TCP connection.
 pub struct Accept {
@@ -71,7 +71,7 @@ impl Task for Connect {
 // Read from a TCP socket.
 pub struct Read {
     pub socket: tcp::Reader, // read data from this file descriptor
-    pub buffer: Box<[u8]>,   // buffer that will contain the data
+    pub buffer: buffer::Slice,   // buffer that will contain the data
 }
 
 impl Task for Read {
@@ -80,6 +80,23 @@ impl Task for Read {
             types::Fd(self.socket.as_raw_fd()),
             self.buffer.as_mut_ptr(),
             self.buffer.len() as _,
+        )
+        .build()
+    }
+}
+
+pub struct ReadFixed {
+    pub socket: tcp::Reader, // read data from this file descriptor
+    pub buffer: buffer::Fixed,   // buffer that will contain the data
+}
+
+impl Task for ReadFixed {
+    fn entry(&mut self) -> Entry {
+        opcode::ReadFixed::new(
+            types::Fd(self.socket.as_raw_fd()),
+            self.buffer.as_mut_ptr(),
+            self.buffer.len() as _,
+            self.buffer.id() as _,
         )
         .build()
     }
@@ -109,13 +126,13 @@ impl Task for Timeout {
 // Write to a TCP socket.
 pub struct Write {
     pub socket: tcp::Writer, // write data to this file descriptor
-    pub buffer: Box<[u8]>,   // buffer that contains the data
+    pub buffer: buffer::Slice,   // buffer that contains the data
     pub start: usize,
     pub end: usize,
 }
 
 impl Write {
-    pub fn new<R>(socket: tcp::Writer, buffer: Box<[u8]>, range: R) -> Self
+    pub fn new<R>(socket: tcp::Writer, buffer: buffer::Slice, range: R) -> Self
     where
         R: ops::RangeBounds<usize>,
     {
@@ -131,24 +148,62 @@ impl Write {
             ops::Bound::Unbounded => buffer.len(),
         };
 
-        Self {
-            socket,
-            buffer,
-            start,
-            end,
-        }
+        Self {socket, buffer, start, end }
     }
 }
 
 impl Task for Write {
     fn entry(&mut self) -> Entry {
         let buffer = &mut self.buffer[self.start..self.end];
+
         opcode::Write::new(
             types::Fd(self.socket.as_raw_fd()),
             buffer.as_mut_ptr(),
             buffer.len() as _,
-        )
-        .build()
+        ).build()
+    }
+}
+
+// Write to a TCP socket.
+pub struct WriteFixed {
+    pub socket: tcp::Writer, // write data to this file descriptor
+    pub buffer: buffer::Fixed,   // buffer that contains the data
+    pub start: usize,
+    pub end: usize,
+}
+
+impl WriteFixed {
+    pub fn new<R>(socket: tcp::Writer, buffer: buffer::Fixed, range: R) -> Self
+    where
+        R: ops::RangeBounds<usize>,
+    {
+        let start = match range.start_bound() {
+            ops::Bound::Included(n) => *n,
+            ops::Bound::Excluded(n) => n + 1,
+            ops::Bound::Unbounded => 0,
+        };
+
+        let end = match range.end_bound() {
+            ops::Bound::Included(n) => n + 1,
+            ops::Bound::Excluded(n) => *n,
+            ops::Bound::Unbounded => buffer.len(),
+        };
+
+        Self {socket, buffer, start, end}
+    }
+}
+
+impl Task for WriteFixed {
+    fn entry(&mut self) -> Entry {
+        let id = self.buffer.id();
+        let buffer = &mut self.buffer[self.start..self.end];
+
+        opcode::WriteFixed::new(
+            types::Fd(self.socket.as_raw_fd()),
+            buffer.as_mut_ptr(),
+            buffer.len() as _,
+            id as _,
+        ).build()
     }
 }
 
@@ -163,6 +218,8 @@ pub enum TaskType {
     Cancel,
     Connect,
     Read,
+    ReadFixed,
     Timeout,
     Write,
+    WriteFixed,
 }

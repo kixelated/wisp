@@ -73,6 +73,23 @@ impl Read {
     }
 }
 
+pub struct ReadFixed {
+    pub task: task::ReadFixed,
+    pub size: Result<usize, io::Error>, // number of bytes that were read
+}
+
+impl ReadFixed {
+    pub fn new(task: task::ReadFixed, ret: i32) -> Self {
+        let size = if ret >= 0 {
+            Ok(ret as usize)
+        } else {
+            Err(io::Error::from_raw_os_error(-ret))
+        };
+
+        Self { task, size }
+    }
+}
+
 pub struct Timeout {
     pub task: task::Timeout,
     pub result: Result<(), io::Error>,
@@ -107,14 +124,33 @@ impl Write {
     }
 }
 
+pub struct WriteFixed {
+    pub task: task::WriteFixed,
+    pub size: Result<usize, io::Error>, // number of bytes that were written
+}
+
+impl WriteFixed {
+    pub fn new(task: task::WriteFixed, ret: i32) -> Self {
+        let size = if ret >= 0 {
+            Ok(ret as usize)
+        } else {
+            Err(io::Error::from_raw_os_error(-ret))
+        };
+
+        Self { task, size }
+    }
+}
+
 #[enum_dispatch]
 pub enum CompletionType {
     Accept,
     Cancel,
     Connect,
     Read,
+    ReadFixed,
     Timeout,
     Write,
+    WriteFixed,
 }
 
 impl CompletionType {
@@ -124,8 +160,10 @@ impl CompletionType {
             task::TaskType::Cancel(task) => CompletionType::Cancel(Cancel::new(task, ret)),
             task::TaskType::Connect(task) => CompletionType::Connect(Connect::new(task, ret)),
             task::TaskType::Read(task) => CompletionType::Read(Read::new(task, ret)),
+            task::TaskType::ReadFixed(task) => CompletionType::ReadFixed(ReadFixed::new(task, ret)),
             task::TaskType::Timeout(task) => CompletionType::Timeout(Timeout::new(task, ret)),
             task::TaskType::Write(task) => CompletionType::Write(Write::new(task, ret)),
+            task::TaskType::WriteFixed(task) => CompletionType::WriteFixed(WriteFixed::new(task, ret)),
         }
     }
 }

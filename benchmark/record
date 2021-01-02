@@ -1,0 +1,6 @@
+#!/bin/bash
+
+set -euxo pipefail
+
+PID=$(lsof -t -i :8080 -s TCP:LISTEN)
+perf record -F 99 -p ${PID} -- ab -c 1000 -t 10 http://127.0.0.1:8080/video

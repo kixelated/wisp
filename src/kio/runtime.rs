@@ -1,9 +1,9 @@
-use std::collections::LinkedList;
 use std::{net, ops, time};
+use std::collections::LinkedList;
 
 use super::completion::CompletionType;
 use super::task::{Task, TaskId, TaskType};
-use super::{task, tcp};
+use super::{task, tcp, buffer};
 
 use io_uring::squeue::{Entry, Flags};
 use io_uring::IoUring;
@@ -18,6 +18,8 @@ pub struct Runtime<'a> {
 
     tasks: Slab<TaskType>,
     backlog: LinkedList<Entry>,
+
+    buffers: buffer::Pool,
 }
 
 impl<'a> Runtime<'a> {
@@ -35,7 +37,33 @@ impl<'a> Runtime<'a> {
 
             tasks: Slab::new(),
             backlog: LinkedList::new(),
+
+            buffers: buffer::Pool::new(),
         })
+    }
+
+    // NOTE: will wait for the ring to idle.
+    pub fn prepare_buffers(&mut self, count: usize, size: usize) -> Result<()>{
+        let mut register_buffers = Vec::with_capacity(count);
+        
+        for id in 0..count {
+            let buffer = buffer::Fixed::new(id, size);
+
+            register_buffers.push(libc::iovec{
+                iov_base: buffer.as_ptr() as _,
+                iov_len: buffer.len(),
+            });
+
+            self.buffers.give(buffer);
+        }
+
+        self.submitter.register_buffers(register_buffers.as_slice())?;
+
+        Ok(())
+    }
+
+    pub fn buffers(&mut self) -> &mut buffer::Pool {
+        &mut self.buffers
     }
 
     pub fn accept(&mut self, socket: net::TcpListener) -> TaskId {
@@ -58,12 +86,20 @@ impl<'a> Runtime<'a> {
         self.run_then(task::Connect::new(socket, addr).into())
     }
 
-    pub fn read(&mut self, socket: tcp::Reader, buffer: Box<[u8]>) -> TaskId {
+    pub fn read(&mut self, socket: tcp::Reader, buffer: buffer::Slice) -> TaskId {
         self.run(task::Read { socket, buffer }.into())
     }
 
-    pub fn read_then(&mut self, socket: tcp::Reader, buffer: Box<[u8]>) -> TaskId {
+    pub fn read_then(&mut self, socket: tcp::Reader, buffer: buffer::Slice) -> TaskId {
         self.run_then(task::Read { socket, buffer }.into())
+    }
+
+    pub fn read_fixed(&mut self, socket: tcp::Reader, buffer: buffer::Fixed) -> TaskId {
+        self.run(task::ReadFixed{socket, buffer}.into())
+    }
+
+    pub fn read_fixed_then(&mut self, socket: tcp::Reader, buffer: buffer::Fixed) -> TaskId {
+        self.run_then(task::ReadFixed{socket, buffer}.into())
     }
 
     // Applies a timeout to the next chain of tasks.
@@ -71,18 +107,32 @@ impl<'a> Runtime<'a> {
         self.run_then(task::Timeout::new(duration).into())
     }
 
-    pub fn write<R>(&mut self, socket: tcp::Writer, buffer: Box<[u8]>, range: R) -> TaskId
+    pub fn write<R>(&mut self, socket: tcp::Writer, buffer: buffer::Slice, range: R) -> TaskId
     where
         R: ops::RangeBounds<usize>,
     {
         self.run(task::Write::new(socket, buffer, range).into())
     }
 
-    pub fn write_then<R>(&mut self, socket: tcp::Writer, buffer: Box<[u8]>, range: R) -> TaskId
+    pub fn write_then<R>(&mut self, socket: tcp::Writer, buffer: buffer::Slice, range: R) -> TaskId
     where
         R: ops::RangeBounds<usize>,
     {
         self.run_then(task::Write::new(socket, buffer, range).into())
+    }
+
+    pub fn write_fixed<R>(&mut self, socket: tcp::Writer, buffer: buffer::Fixed, range: R) -> TaskId
+    where
+        R: ops::RangeBounds<usize>,
+    {
+        self.run(task::WriteFixed::new(socket, buffer, range).into())
+    }
+
+    pub fn write_fixed_then<R>(&mut self, socket: tcp::Writer, buffer: buffer::Fixed, range: R) -> TaskId
+    where
+        R: ops::RangeBounds<usize>,
+    {
+        self.run_then(task::WriteFixed::new(socket, buffer, range).into())
     }
 
     /// Run the given task asynchronously.
